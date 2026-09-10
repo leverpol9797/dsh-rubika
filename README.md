@@ -9,6 +9,10 @@ A DSH (cordis) plugin that connects your DeepSeek Harness agent to the
   chat are serialized through a queue so rapid messages don't race.
 - Optional **user allowlist**, **allow-all flag**, and **group allowlist**.
 - Button clicks (`aux_data.button_id`) and `CallbackQuery` updates are routed as text.
+- **File attachments**: images → vision (agent sees the picture),
+  PDF → extracted text ([`unpdf`](https://www.npmjs.com/package/unpdf)),
+  text formats (`srt/txt/md/json/code/...`) → inline text.
+  Caps: 20MB download, 50k chars of text per file.
 
 Inspired by the [hermes-agent](https://github.com/NousResearch/hermes-agent)
 gateway architecture, adapted to DSH's cordis plugin system.
@@ -17,8 +21,9 @@ gateway architecture, adapted to DSH's cordis plugin system.
 
 | File          | Purpose                                                        |
 |---------------|----------------------------------------------------------------|
-| `gateway.js`  | The plugin (single file). `name` + `inject` + `apply(ctx)`.    |
-| `install.sh`  | Installer: copies the plugin, symlinks DSH packages, registers it in `cordis.patch.yml`. |
+| `gateway.js`  | The plugin. `name` + `inject` + `apply(ctx)`.                  |
+| `package.json`| `type: module` + runtime dep `unpdf` (PDF text extraction).    |
+| `install.sh`  | Installer: copies files, `npm install`, symlinks DSH packages, registers in `cordis.patch.yml`. |
 | `.env.example`| All supported environment variables with examples.           |
 
 ## Requirements
@@ -40,8 +45,10 @@ sudo bash install.sh
 
 What `install.sh` does, step by step:
 
-1. **Copies** `gateway.js` → `/home/dsh/dsh-rubika/gateway.js`
-2. **Symlinks** the DSH packages the plugin imports, so plain `node`
+1. **Copies** `gateway.js` + `package.json` → `/home/dsh/dsh-rubika/`
+2. **Runs `npm install`** for the runtime dep (`unpdf`).
+   ⚠️ Must run *before* step 3 — npm prunes the symlinks.
+3. **Symlinks** the DSH packages the plugin imports, so plain `node`
    resolution works from the plugin dir:
    ```
    /home/dsh/dsh-rubika/node_modules/@deepseek-ai/
@@ -133,7 +140,20 @@ Rubika client → botapi.rubika.ir/v3/{token}/getUpdates (long poll, 1s)
    boundary. Kept minimal: `{ cwd: process.cwd() }`.
 5. **Missing `inject`** — cordis forbids `ctx.agents` without declaring it
    (`cannot get property "agents" without inject`). Now
-   `inject = ["agents", "agentDefaultModel"]`.
+   `inject = ["agents", "agentDefaultModel", "attachments"]`.
+
+## File attachments
+
+| Kind | Handling |
+|------|----------|
+| 🖼️ Image (`jpg/png/webp/gif`) | Downloaded via `getFile` → stored with `ctx.attachments.saveImage` → sent as an `image` content block. The agent **sees** the picture. |
+| 📕 PDF | Downloaded → text extracted per page with `unpdf` → sent as text. Scanned (image-only) PDFs yield no text. |
+| 📝 Text (`srt/vtt/txt/md/json/csv/code/...`) | Downloaded → decoded UTF-8 → sent inline. |
+| 🎵🎬📦 Audio/video/archives/other | Metadata only (name + size) — content is not readable. |
+
+Limits: max 20MB download, max 50,000 chars of text per file —
+protects Railway memory. Failures degrade gracefully (the agent is told
+the download/extraction failed instead of crashing).
 
 ## License
 

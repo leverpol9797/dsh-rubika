@@ -3,11 +3,13 @@
 # install.sh — install dsh-rubika (Rubika Bot Gateway) on a DSH host.
 #
 # What it does:
-#   1. Copies gateway.js to /home/dsh/dsh-rubika/gateway.js
-#   2. Symlinks the DSH packages the plugin imports
+#   1. Copies gateway.js + package.json to /home/dsh/dsh-rubika/
+#   2. Runs `npm install` for runtime deps (unpdf — PDF text extraction)
+#   3. Symlinks the DSH packages the plugin imports
 #      (@deepseek-ai/dsh-agent, dsh-llm, dsh-session, cordis, schemastery)
 #      so plain `node` resolution works from the plugin directory.
-#   3. Registers the plugin in the profile's cordis.patch.yml (profile: web).
+#      NOTE: symlinks come AFTER npm install, because npm prunes them.
+#   4. Registers the plugin in the profile's cordis.patch.yml (profile: web).
 #
 # Usage:
 #   sudo bash install.sh            # default paths
@@ -58,12 +60,19 @@ if [ -z "$DSH_PKG" ]; then
 fi
 echo "DSH packages: $DSH_PKG"
 
-# --- 1. Copy the plugin file ---
+# --- 1. Copy the plugin files ---
 mkdir -p "$PLUGIN_DIR"
 cp -f "$SCRIPT_DIR/gateway.js" "$PLUGIN_DIR/gateway.js"
-echo "Installed: $PLUGIN_DIR/gateway.js"
+cp -f "$SCRIPT_DIR/package.json" "$PLUGIN_DIR/package.json"
+echo "Installed: $PLUGIN_DIR/gateway.js + package.json"
 
-# --- 2. Symlink DSH packages for plain node resolution ---
+# --- 2. Install runtime deps (unpdf for PDF text extraction) ---
+# NOTE: npm install prunes unknown entries in node_modules (including our
+# symlinks below), so this MUST run before step 3.
+(cd "$PLUGIN_DIR" && npm install --omit=dev --no-audit --no-fund)
+echo "npm deps installed (unpdf)."
+
+# --- 3. Symlink DSH packages for plain node resolution (after npm!) ---
 mkdir -p "$PLUGIN_DIR/node_modules/@deepseek-ai"
 link_pkg() {
   local name="$1" src="$2"
@@ -81,11 +90,11 @@ elif [ -d "$DSH_PKG/node_modules/@deepseek-ai/dsh-llm/node_modules/@deepseek-ai/
   link_pkg schemastery "$DSH_PKG/node_modules/@deepseek-ai/dsh-llm/node_modules/@deepseek-ai/schemastery"
 fi
 
-# --- 3. Sanity check: node can resolve the imports ---
+# --- 4. Sanity check: node can resolve the imports ---
 node --check "$PLUGIN_DIR/gateway.js"
 node -e "import('$PLUGIN_DIR/gateway.js').then(m => console.log('Import OK, exports:', Object.keys(m).join(', ')))"
 
-# --- 4. Register in cordis.patch.yml ---
+# --- 5. Register in cordis.patch.yml ---
 mkdir -p "$PROFILE_DIR"
 touch "$PATCH_FILE"
 if grep -q "dsh-rubika" "$PATCH_FILE" 2>/dev/null; then

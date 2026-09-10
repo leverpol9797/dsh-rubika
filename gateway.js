@@ -12,6 +12,7 @@
  *   RUBIKA_GROUP_ALLOWED_CHATS — optional, comma-separated group chat IDs
  */
 
+import { randomUUID } from "node:crypto";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
@@ -19,8 +20,8 @@ import { SessionId } from "@deepseek-ai/dsh-session";
 // ─── Plugin metadata ─────────────────────────────────────────────────────────
 
 export const name = "dsh-rubika";
-// Declare required services so cordis allows ctx.agents / ctx.get("agentDefaultModel").
-export const inject = ["agents", "agentDefaultModel"];
+// Declare required services: cordis forbids ctx.<svc> access without inject.
+export const inject = ["agents", "agentDefaultModel", "attachments"];
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -29,6 +30,29 @@ const MAX_MESSAGE_LENGTH = 4096;
 const POLL_INTERVAL_MS = 1000;
 const RECONNECT_BACKOFF = [2, 5, 10, 30, 60];
 const DEDUP_MAX = 1000;
+
+// ─── File attachment limits ──────────────────────────────────────────────────
+// Caps protect Railway memory: downloads beyond the cap are refused, extracted
+// text beyond the cap is truncated.
+const MAX_FILE_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20MB
+const MAX_FILE_TEXT_CHARS = 50_000; // ~50KB of extracted text per file
+
+const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "webp", "gif"]);
+const IMAGE_MIME = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+  gif: "image/gif",
+};
+// Plain-text formats read directly (subtitles, docs, data, source code, ...).
+const TEXT_EXTS = new Set([
+  "txt", "srt", "vtt", "lrc", "md", "markdown", "json", "jsonl", "csv", "tsv",
+  "log", "xml", "html", "htm", "yaml", "yml", "toml", "ini", "cfg", "conf",
+  "env", "js", "mjs", "cjs", "ts", "jsx", "tsx", "py", "sh", "bash", "c", "h",
+  "cpp", "hpp", "java", "go", "rs", "php", "rb", "swift", "kt", "sql", "css",
+  "scss", "vue", "diff", "patch",
+]);
 
 // ─── Environment helpers ─────────────────────────────────────────────────────
 
@@ -125,6 +149,144 @@ async function rubikaGetChatInfo(token, chatId) {
   }
 }
 
+// ─── File download + conversion ──────────────────────────────────────────────
+// Converts a Rubika file attachment into agent-ready message content:
+//   images → image content block (agent sees the picture)
+//   PDF → extracted per-page text (via unpdf)
+//   text formats (srt/txt/md/json/code/...) → inline text
+//   audio/video/archives/other → metadata note (content not readable)
+
+function formatBytes(n) {
+  const v = parseInt(n || "0", 10);
+  if (!v) return "نامشخص";
+  if (v < 1024) return `${v} بایت`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)}KB`;
+  return `${(v / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+function fileExt(name) {
+  const m = /\.([a-z0-9]{1,10})$/i.exec(name || "");
+  return (m?.[1] || "").toLowerCase();
+}
+
+async function rubikaGetFile(token, fileId) {
+  return rubikaPost("getFile", token, { file_id: fileId }, 15_000);
+}
+
+async function downloadBytes(url, maxBytes, timeoutMs = 30_000) {
+  const resp = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!resp.ok) throw new Error(`Download HTTP ${resp.status}`);
+  const buf = new Uint8Array(await resp.arrayBuffer());
+  if (buf.length > maxBytes) {
+    throw new Error(
+      `حجم فایل (${formatBytes(buf.length)}) از سقف مجاز بیشتر است.`
+    );
+  }
+  return buf;
+}
+
+async function resolveDownloadUrl(token, fileId) {
+  const dl = await rubikaGetFile(token, fileId);
+  const url = dl.data?.download_url;
+  if (!url) throw new Error("لینک دانلود دریافت نشد.");
+  return url;
+}
+
+/**
+ * Downloads a Rubika file and converts it to agent-ready content.
+ * @returns {{ text: string, blocks: Array }} text augments the caption,
+ *   blocks are extra user-message content blocks (e.g. images).
+ */
+async function prepareFileContent(ctx, token, file, caption) {
+  const name = file?.file_name || "فایل";
+  const ext = fileExt(name);
+  const fileId = file?.file_id;
+  const base = caption ? `${caption}\n` : "";
+
+  if (!fileId) {
+    return { text: `${base}[فایل: ${name}]`, blocks: [] };
+  }
+
+  // ── Images: download → attachments.saveImage → image block ──
+  if (IMAGE_EXTS.has(ext)) {
+    try {
+      const url = await resolveDownloadUrl(token, fileId);
+      const bytes = await downloadBytes(url, MAX_FILE_DOWNLOAD_BYTES);
+      const ref = await ctx.attachments.saveImage({
+        data: bytes,
+        mediaType: IMAGE_MIME[ext],
+        name,
+      });
+      return {
+        text: `${base}[عکس: ${name}] — لطفاً این تصویر را تحلیل کن.`,
+        blocks: [{ type: "image", attachment: ref }],
+      };
+    } catch (err) {
+      console.error(`[dsh-rubika] Image failed for ${name}:`, err.message);
+      return {
+        text: `${base}[عکس: ${name} — دانلود ناموفق بود: ${err.message}]`,
+        blocks: [],
+      };
+    }
+  }
+
+  // ── PDF: download → extract text per page ──
+  if (ext === "pdf") {
+    try {
+      const url = await resolveDownloadUrl(token, fileId);
+      const bytes = await downloadBytes(url, MAX_FILE_DOWNLOAD_BYTES);
+      const { extractText } = await import("unpdf");
+      const { text, totalPages } = await extractText(bytes);
+      const joined = (Array.isArray(text) ? text.join("\n") : String(text || ""))
+        .trim()
+        .slice(0, MAX_FILE_TEXT_CHARS);
+      if (!joined) {
+        return {
+          text: `${base}[PDF با ${totalPages} صفحه: ${name} — متنی استخراج نشد (ممکن است اسکن‌شده باشد).]`,
+          blocks: [],
+        };
+      }
+      return {
+        text: `${base}[متن استخراج‌شده از PDF «${name}» (${totalPages} صفحه):]\n${joined}`,
+        blocks: [],
+      };
+    } catch (err) {
+      console.error(`[dsh-rubika] PDF failed for ${name}:`, err.message);
+      return {
+        text: `${base}[PDF: ${name} — استخراج متن ناموفق بود: ${err.message}]`,
+        blocks: [],
+      };
+    }
+  }
+
+  // ── Plain text formats (srt, txt, md, json, code...): download → inline ──
+  if (TEXT_EXTS.has(ext)) {
+    try {
+      const url = await resolveDownloadUrl(token, fileId);
+      const bytes = await downloadBytes(url, MAX_FILE_DOWNLOAD_BYTES);
+      const decoded = new TextDecoder("utf-8", { fatal: false })
+        .decode(bytes)
+        .slice(0, MAX_FILE_TEXT_CHARS);
+      return {
+        text: `${base}[محتوای فایل «${name}»:]\n${decoded}`,
+        blocks: [],
+      };
+    } catch (err) {
+      console.error(`[dsh-rubika] Text file failed for ${name}:`, err.message);
+      return {
+        text: `${base}[فایل: ${name} — دانلود ناموفق بود: ${err.message}]`,
+        blocks: [],
+      };
+    }
+  }
+
+  // ── Audio/video/archives/others: metadata only ──
+  return {
+    text: `${base}[فایل: ${name} (${formatBytes(file?.size)}) — این نوع فایل قابل خواندن نیست؛ فقط مشخصاتش ارسال شد.]`,
+    blocks: [],
+  };
+}
+
 // ─── Per-chat message queue ──────────────────────────────────────────────────
 // Serializes message processing per chat so two rapid messages don't race.
 
@@ -217,7 +379,7 @@ function extractReply(session, afterSeq) {
 
 // ─── Message handling ────────────────────────────────────────────────────────
 
-async function handleUserMessage(ctx, token, chatId, text, senderId) {
+async function handleUserMessage(ctx, token, chatId, text, senderId, extraBlocks) {
   // ── Authorization ──
   if (!isAllowAll()) {
     const allowed = getAllowedUsers();
@@ -254,10 +416,12 @@ async function handleUserMessage(ctx, token, chatId, text, senderId) {
   // ── Record sequence before submitting message ──
   const firstSeq = agent.session.seq;
 
-  // ── Submit message ──
+  // ── Submit message (text + optional extra blocks, e.g. images) ──
+  const content = [{ type: "text", text }];
+  if (extraBlocks?.length) content.push(...extraBlocks);
   agent.followup(
     createUserMessage({
-      content: [{ type: "text", text }],
+      content,
       source: { kind: "user" },
     })
   );
@@ -325,8 +489,8 @@ async function processUpdate(ctx, token, update) {
   }
 
   const text = (msg.text || "").trim();
-  const hasMedia = !!(msg.file?.file_id);
-  if (!text && !hasMedia) return;
+  const file = msg.file?.file_id ? msg.file : null;
+  if (!text && !file) return;
   if (!update.chat_id) return;
 
   // ── Group allowlist check ──
@@ -338,10 +502,27 @@ async function processUpdate(ctx, token, update) {
     }
   }
 
+  // ── File attachment: download + convert to agent-ready content ──
+  // (images → image block, PDF/text → extracted text, rest → metadata note)
+  let displayText = text;
+  let extraBlocks = [];
+  if (file) {
+    const prepared = await prepareFileContent(ctx, token, file, text);
+    displayText = prepared.text;
+    extraBlocks = prepared.blocks;
+  }
+  if (!displayText.trim() && !extraBlocks.length) return;
+
   // ── Enqueue for processing ──
-  const displayText = text || "[فایل رسانه]";
   const chatQueue = enqueueChat(update.chat_id, () =>
-    handleUserMessage(ctx, token, update.chat_id, displayText, msg.sender_id)
+    handleUserMessage(
+      ctx,
+      token,
+      update.chat_id,
+      displayText,
+      msg.sender_id,
+      extraBlocks
+    )
   );
   await chatQueue;
 }
@@ -410,16 +591,21 @@ function sleep(ms, signal) {
 
 // ─── DSH Plugin entry point ──────────────────────────────────────────────────
 
+import { writeFileSync } from "node:fs";
+
+const DEBUG_FILE = "/home/dsh/dsh-rubika/.applied";
+
 export function apply(ctx) {
+  // Debug: write file to confirm apply() was called
+  writeFileSync(DEBUG_FILE, new Date().toISOString() + " apply() called\n");
+
   const token = getToken();
   if (!token) {
-    console.error(
-      "[dsh-rubika] RUBIKA_BOT_TOKEN is not set — gateway disabled."
-    );
+    writeFileSync(DEBUG_FILE, new Date().toISOString() + " RUBIKA_BOT_TOKEN not set\n");
     return;
   }
 
-  console.log("[dsh-rubika] Starting Rubika gateway...");
+  writeFileSync(DEBUG_FILE, new Date().toISOString() + " starting gateway...\n");
 
   ctx.effect(() => {
     const controller = new AbortController();
