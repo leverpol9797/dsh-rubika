@@ -191,6 +191,34 @@ Rubika client → botapi.rubika.ir/v3/{token}/getUpdates (long poll, 1s)
    `selectionFor()` behaves, with a last-known-good fallback for unreadable
    defaults.
 
+
+## Enabling Vision (Image Input) Support
+
+If your `llm-pi-ai` provider uses a custom endpoint (e.g., `openai-completions` API via a proxy like `9router-production`) and you want to enable image input (vision) for models like `gemini/gemini-2.5-flash` or `gpt-4o`, you may encounter an error like `pi-ai model "..." does not support image input`.
+
+This happens because the `dsh-llm-pi-ai` adapter, by default, assumes models from custom `openai-completions` API endpoints are text-only unless explicitly told otherwise.
+
+To enable vision support for your provider's models, add `defaultInput: ["text", "image"]` to your provider's configuration in your DeepSeek Harness `settings.yaml` file (usually at `/home/dsh/.dsh/settings.yaml`). For example:
+
+```yaml
+llm-pi-ai:
+  providers:
+    ac:
+      apiKeyEnv: AC_API_KEY
+      api: openai-completions
+      baseURL: https://9router-production-197e.up.railway.app/v1
+      models:
+        - id: gemini/gemini-2.5-flash
+          name: Gemini
+        # ... other models
+      defaultInput: ["text", "image"] # <--- Add this line
+agent-default-model:
+  provider: ac
+  model: gemini/gemini-2.5-flash # <--- Ensure a vision-capable model is selected
+```
+
+After editing `settings.yaml`, restart your DeepSeek Harness instance for the changes to take effect.
+
 ## File attachments
 
 | Kind | Handling |
