@@ -6,7 +6,7 @@
 #   1. Copies gateway.js + package.json to /home/dsh/dsh-rubika/
 #   2. Runs `npm install` for runtime deps (unpdf — PDF text extraction)
 #   3. Symlinks the DSH packages the plugin imports
-#      (@deepseek-ai/dsh-agent, dsh-llm, dsh-session, cordis, schemastery)
+#      (@deepseek-ai/dsh-agent, dsh-llm, dsh-session, dsh-tools, cordis, schemastery)
 #      so plain `node` resolution works from the plugin directory.
 #      NOTE: symlinks come AFTER npm install, because npm prunes them.
 #   4. Registers the plugin in the profile's cordis.patch.yml (profile: web).
@@ -96,6 +96,7 @@ link_pkg cordis      "$DSH_PKG/node_modules/@deepseek-ai/cordis"
 link_pkg dsh-agent   "$DSH_PKG/node_modules/@deepseek-ai/dsh-agent"
 link_pkg dsh-llm     "$DSH_PKG/node_modules/@deepseek-ai/dsh-llm"
 link_pkg dsh-session "$DSH_PKG/node_modules/@deepseek-ai/dsh-session"
+link_pkg dsh-tools   "$DSH_PKG/node_modules/@deepseek-ai/dsh-tools"
 # schemastery ships nested under dsh-llm on some installs:
 if [ -d "$DSH_PKG/node_modules/@deepseek-ai/schemastery" ]; then
   link_pkg schemastery "$DSH_PKG/node_modules/@deepseek-ai/schemastery"

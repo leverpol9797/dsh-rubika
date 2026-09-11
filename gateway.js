@@ -16,12 +16,14 @@ import { randomUUID } from "node:crypto";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
+import { defineTool } from "@deepseek-ai/dsh-tools";
+import * as fs from "node:fs/promises";
 
 // ─── Plugin metadata ─────────────────────────────────────────────────────────
 
 export const name = "dsh-rubika";
 // Declare required services: cordis forbids ctx.<svc> access without inject.
-export const inject = ["agents", "agentDefaultModel", "agentPresets", "sessionPersistence"];
+export const inject = ["agents", "agentDefaultModel", "agentPresets", "sessionPersistence", "tools"]; // <-- ADDED "tools"
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -147,6 +149,147 @@ async function rubikaGetChatInfo(token, chatId) {
   } catch {
     return { name: chatId, type: "dm", username: null };
   }
+}
+
+// ─── File upload (agent → Rubika) ────────────────────────────────────────────
+// Rubika Bot API v3 file sending is a 3-step flow (see
+// https://rubika.ir/botapi/methods):
+//   1. requestSendFile { type: FileTypeEnum } → { upload_url }
+//   2. POST the bytes to upload_url as multipart/form-data field `file`
+//      → { file_id }
+//   3. sendFile { chat_id, file_id, text? } → message is delivered.
+//
+// FileTypeEnum (from https://rubika.ir/botapi/models): File (generic, ≤50MB),
+// Image (jpg/gif/png/webp, ≤10MB), Voice (short mp3), Video (mp4, ≤50MB),
+// Music (mp3), Gif (silent mp4).
+
+// Agent-facing kind → Rubika FileTypeEnum.
+const SEND_KIND_TO_FILE_TYPE = {
+  photo: "Image",
+  video: "Video",
+  audio: "Music",
+  voice: "Voice",
+  document: "File",
+  gif: "Gif",
+  file: "File",
+};
+
+// Max bytes Rubika accepts per FileTypeEnum (docs). Reads beyond the cap are
+// refused before upload to protect Railway memory.
+const SEND_FILE_MAX_BYTES = {
+  Image: 10 * 1024 * 1024, // 10MB
+  File: 50 * 1024 * 1024, // 50MB
+  Video: 50 * 1024 * 1024, // 50MB
+  Music: 50 * 1024 * 1024,
+  Voice: 50 * 1024 * 1024,
+  Gif: 50 * 1024 * 1024,
+};
+
+const SEND_FILE_MIME = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+  gif: "image/gif",
+  mp3: "audio/mpeg",
+  mp4: "video/mp4",
+  ogg: "audio/ogg",
+  wav: "audio/wav",
+  pdf: "application/pdf",
+  zip: "application/zip",
+};
+
+/** Step 1: ask Rubika for a dedicated upload URL for this file type. */
+async function rubikaRequestSendFile(token, fileTypeEnum) {
+  const data = await rubikaPost(
+    "requestSendFile",
+    token,
+    { type: fileTypeEnum },
+    15_000
+  );
+  if (data?.status === "ERROR") {
+    throw new Error(
+      `Rubika requestSendFile error: ${data.status_det || JSON.stringify(data).slice(0, 200)}`
+    );
+  }
+  const uploadUrl = data?.data?.upload_url ?? data?.upload_url;
+  if (!uploadUrl) {
+    throw new Error(
+      `Rubika requestSendFile returned no upload_url: ${JSON.stringify(data).slice(0, 200)}`
+    );
+  }
+  return uploadUrl;
+}
+
+/** Step 2: POST raw bytes to the upload_url; returns the file_id. */
+async function rubikaUploadBytes(uploadUrl, bytes, fileName, mediaType, timeoutMs = 60_000) {
+  const formData = new FormData();
+  formData.append(
+    "file",
+    new Blob([bytes], { type: mediaType || "application/octet-stream" }),
+    fileName
+  );
+  const resp = await fetch(uploadUrl, {
+    method: "POST",
+    body: formData,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(`Upload HTTP ${resp.status}: ${JSON.stringify(data).slice(0, 200)}`);
+  }
+  if (data?.status === "ERROR") {
+    throw new Error(
+      `Rubika upload error: ${data.status_det || JSON.stringify(data).slice(0, 200)}`
+    );
+  }
+  const fileId = data?.data?.file_id ?? data?.file_id;
+  if (!fileId) {
+    throw new Error(
+      `Rubika upload returned no file_id: ${JSON.stringify(data).slice(0, 200)}`
+    );
+  }
+  return fileId;
+}
+
+/** Step 3: deliver the uploaded file_id to a chat. */
+async function rubikaDeliverFile(token, chatId, fileId, text) {
+  const body = { chat_id: chatId, file_id: fileId };
+  if (text) body.text = text.slice(0, MAX_MESSAGE_LENGTH);
+  return rubikaPost("sendFile", token, body, 15_000);
+}
+
+/**
+ * Send one file from disk to a Rubika chat (full 3-step flow).
+ * @param {string} kind - photo | video | audio | voice | document | file
+ * @returns {{ fileId: string, messageId: string|undefined }} delivery receipt
+ */
+async function rubikaSendFile(token, chatId, kind, filePath, caption) {
+  const fileTypeEnum = SEND_KIND_TO_FILE_TYPE[kind] ?? "File";
+  const cap = SEND_FILE_MAX_BYTES[fileTypeEnum] ?? MAX_FILE_DOWNLOAD_BYTES;
+  let bytes;
+  try {
+    bytes = await fs.readFile(filePath);
+  } catch (err) {
+    throw new Error(`Cannot read file "${filePath}": ${err.message}`);
+  }
+  if (bytes.length > cap) {
+    throw new Error(
+      `حجم فایل (${formatBytes(bytes.length)}) از سقف روبیکا برای نوع ${fileTypeEnum} بیشتر است.`
+    );
+  }
+  const fileName = filePath.split("/").pop() || "file";
+  const mediaType = SEND_FILE_MIME[fileExt(fileName)] || "application/octet-stream";
+
+  const uploadUrl = await rubikaRequestSendFile(token, fileTypeEnum);
+  const fileId = await rubikaUploadBytes(uploadUrl, bytes, fileName, mediaType);
+  const delivered = await rubikaDeliverFile(token, chatId, fileId, caption);
+  if (delivered?.status === "ERROR") {
+    throw new Error(
+      `Rubika sendFile error: ${delivered.status_det || JSON.stringify(delivered).slice(0, 200)}`
+    );
+  }
+  return { fileId, messageId: delivered?.data?.message_id ?? delivered?.message_id };
 }
 
 // ─── File download + conversion ──────────────────────────────────────────────
@@ -327,6 +470,21 @@ async function resetChatAgent(chatId) {
     _agents.delete(chatId);
   }
   _chatSessionSuffix.set(chatId, randomUUID().slice(0, 8));
+}
+
+/** Reverse lookup: live agent object → chat_id (for tools called without chatId). */
+function findChatIdForAgent(agent) {
+  if (!agent) return undefined;
+  for (const [chatId, entry] of _agents) {
+    if (entry?.agent === agent) return chatId;
+  }
+  // Fallback: parse the session id (rubika:<chat_id>[:suffix]).
+  try {
+    const sid = String(agent.session?.id ?? agent.sessionId ?? "");
+    const m = /^rubika:(.+)$/.exec(sid);
+    if (m) return m[1].split(":")[0] || undefined;
+  } catch { /* ignore */ }
+  return undefined;
 }
 
 async function getOrCreateAgent(ctx, chatId) {
@@ -755,6 +913,82 @@ export function apply(ctx) {
   }
 
   console.log("[dsh-rubika] Starting Rubika gateway...");
+
+  // ─── DSH Tool: rubika_send_file ────────────────────────────────────────────
+  // Sends a file from the server disk to a Rubika chat. Registered on the
+  // host plane so every agent composition can call it; preset compositions
+  // still decide which tools an agent may actually use.
+  const rubikaTools = ctx.get("tools") ?? ctx.tools;
+  if (rubikaTools?.register) {
+    try {
+      rubikaTools.register(defineTool({
+        name: "rubika_send_file",
+        description: "Send a file from the server to a Rubika chat (photo, video, audio, or document). Use it when the user asks for a file to be delivered to Rubika, or to report generated artifacts there. When called from a Rubika chat session, chatId defaults to that chat — omit it unless sending elsewhere.",
+        parameters: {
+          filePath: {
+            type: "string",
+            required: true,
+            description: "Absolute path to the file on the server (e.g. /home/dsh/workspace/report.pdf).",
+          },
+          chatId: {
+            type: "string",
+            description: "Rubika chat_id to send the file to (e.g. uXXXX for a user, gXXXX for a group). Omit to send to the current Rubika chat.",
+          },
+          fileType: {
+            type: "string",
+            required: true,
+            enum: ["photo", "video", "audio", "voice", "document"],
+            description: "Type of file: photo (jpg/gif/png/webp, ≤10MB), video (mp4, ≤50MB), audio/voice (mp3), or document (generic, ≤50MB).",
+          },
+          caption: {
+            type: "string",
+            description: "Caption for the file (max 1024 characters).",
+          },
+        },
+        output: {
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              sent: { type: "boolean", required: true },
+              fileName: { type: "string", required: true },
+              chatId: { type: "string", required: true },
+              detail: { type: "string", required: true },
+              fileId: { type: "string" },
+            },
+          },
+          render: (_args, value) =>
+            [{ type: "text", text: value.detail }],
+        },
+        async execute(args, exec) {
+          const token = getToken();
+          if (!token) throw new Error("RUBIKA_BOT_TOKEN is not set; cannot send file.");
+          const { filePath, fileType, caption } = args;
+          // Default to the chat this agent belongs to when chatId is omitted.
+          const chatId = args.chatId || findChatIdForAgent(exec?.agent);
+          if (!chatId) {
+            throw new Error(
+              "chatId is required when calling rubika_send_file outside a Rubika chat session."
+            );
+          }
+          const fileName = filePath.split("/").pop() || "file";
+          try {
+            const { fileId } = await rubikaSendFile(token, chatId, fileType, filePath, caption);
+            const detail = `فایل ${fileName} با موفقیت به چت ${chatId} ارسال شد.`;
+            return { sent: true, fileName, chatId, detail, fileId };
+          } catch (err) {
+            console.error(`[dsh-rubika] Error sending file ${filePath} to ${chatId}:`, err.message);
+            throw new Error(`خطا در ارسال فایل به روبیکا: ${err.message}`);
+          }
+        },
+      }));
+      console.log("[dsh-rubika] Registered tool: rubika_send_file");
+    } catch (err) {
+      console.warn("[dsh-rubika] Could not register rubika_send_file tool:", err.message);
+    }
+  } else {
+    console.warn("[dsh-rubika] tools service unavailable — rubika_send_file not registered.");
+  }
 
   ctx.effect(() => {
     const controller = new AbortController();

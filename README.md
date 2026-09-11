@@ -196,26 +196,35 @@ Rubika client → botapi.rubika.ir/v3/{token}/getUpdates (long poll, 1s)
 
 The `dsh-rubika` plugin exposes a custom tool for agents to send files to Rubika chats.
 
-### `rubika.sendFile`
+### `rubika_send_file`
 
-Send a file (photo, video, audio, or document) from the server to a Rubika chat.
+Send a file from the server disk to a Rubika chat, using Rubika Bot API v3's
+3-step flow (`requestSendFile` → upload to `upload_url` → `sendFile` with the
+returned `file_id`). See [methods](https://rubika.ir/botapi/methods) and
+[models (`FileTypeEnum`)](https://rubika.ir/botapi/models).
 
 **Parameters:**
 
-*   `filePath` (string, required): Path to the file on the server (e.g., in `dsh/workspace/my_image.png`). The agent must have created or gained access to this file.
-*   `chatId` (string, required): Rubika `chat_id` to send the file to.
-*   `fileType` (enum: `'photo' | 'video' | 'audio' | 'document'`, required): Type of file to send.
-    *   `'photo'`: For images (e.g., JPG, PNG).
-    *   `'video'`: For video files (e.g., MP4).
-    *   `'audio'`: For audio files (e.g., MP3, OGG).
-    *   `'document'`: For general documents (e.g., PDF, TXT, ZIP).
-*   `caption` (string, optional): Caption for the file (max. 1024 characters).
+*   `filePath` (string, required): Absolute path to the file on the server
+    (e.g. `/home/dsh/workspace/report.pdf`). The agent must have created or
+    gained access to this file.
+*   `chatId` (string, optional): Rubika `chat_id` to send to. **Omit it** when
+    calling from a Rubika chat session — the tool delivers to the current chat
+    automatically.
+*   `fileType` (required): one of `photo` (jpg/gif/png/webp, ≤10MB), `video`
+    (mp4, ≤50MB), `audio` (mp3), `voice` (short mp3), `document` (generic,
+    ≤50MB).
+*   `caption` (string, optional): caption/text sent with the file.
 
-**Example usage from an agent (using Markdown code blocks for tool calls):**
+**Example usage from an agent:**
 
 ```python
-print(default_api.rubika.sendFile(chatId="YOUR_RUBIKA_CHAT_ID", filePath="output.txt", fileType="document", caption="Here is the analysis report."))
+print(default_api.rubika_send_file(filePath="/home/dsh/workspace/analysis.pdf", fileType="document", caption="Here is the analysis report."))
 ```
+
+The tool is registered on the host plane (`ctx.tools.register`), so every
+deployment composition can call it; agent presets decide availability per
+session. It returns `{ sent, fileName, chatId, detail, fileId }`.
 
 ## Enabling Vision (Image Input) Support
 
