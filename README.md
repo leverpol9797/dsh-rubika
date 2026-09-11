@@ -9,6 +9,7 @@ A DSH (cordis) plugin that connects your DeepSeek Harness agent to the
   chat are serialized through a queue so rapid messages don't race.
 - Optional **user allowlist**, **allow-all flag**, and **group allowlist**.
 - Button clicks (`aux_data.button_id`) and `CallbackQuery` updates are routed as text.
+- **Commands**: `/new`, `/reset`, `/clear` → disposes the current chat agent and starts a fresh session (same as clicking `+` in DSH Web).
 - **File attachments**: images → vision (agent sees the picture),
   PDF → extracted text ([`unpdf`](https://www.npmjs.com/package/unpdf)),
   text formats (`srt/txt/md/json/code/...`) → inline text.

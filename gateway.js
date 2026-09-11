@@ -313,6 +313,21 @@ function enqueueChat(chatId, fn) {
 
 /** In-memory agent handles: chat_id → { agent, dispose } */
 const _agents = new Map();
+/** Session ID suffixes for new sessions: chat_id → suffix string */
+const _chatSessionSuffix = new Map();
+
+async function resetChatAgent(chatId) {
+  const existing = _agents.get(chatId);
+  if (existing) {
+    try {
+      await existing.dispose();
+    } catch (err) {
+      console.error(`[dsh-rubika] Agent dispose error for ${chatId}:`, err.message);
+    }
+    _agents.delete(chatId);
+  }
+  _chatSessionSuffix.set(chatId, randomUUID().slice(0, 8));
+}
 
 async function getOrCreateAgent(ctx, chatId) {
   if (_agents.has(chatId)) return _agents.get(chatId);
@@ -328,7 +343,8 @@ async function getOrCreateAgent(ctx, chatId) {
   // currentSelection() returns { provider, model, reasoningEffort? }
   const hasModel = !!(selection && selection.provider && selection.model);
 
-  const sessionId = SessionId(`rubika:${chatId}`);
+  const suffix = _chatSessionSuffix.get(chatId);
+  const sessionId = SessionId(suffix ? `rubika:${chatId}:${suffix}` : `rubika:${chatId}`);
 
   // NOTE: meta only accepts validated session fields (cwd, parentSession,
   // seedLength, origin, delegationDepth, agentPreset). Extra keys fail the
@@ -395,6 +411,18 @@ async function handleUserMessage(ctx, token, chatId, text, senderId, extraBlocks
       ).catch(() => {});
       return;
     }
+  }
+
+  // ── Command: reset session (/new, /reset, /clear) ──
+  const cmd = (text || "").trim().toLowerCase();
+  if (cmd === "/new" || cmd === "/reset" || cmd === "/clear") {
+    await resetChatAgent(chatId);
+    await rubikaSendMessage(
+      token,
+      chatId,
+      "🔄 نشست جدید ایجاد شد! گفتگو و حافظه دستیار بازنشانی گردید."
+    ).catch(() => {});
+    return;
   }
 
   // ── Get or create agent ──
@@ -627,6 +655,7 @@ export function apply(ctx) {
       }
       _agents.clear();
       _chatQueues.clear();
+      _chatSessionSuffix.clear();
     };
   }, "dsh-rubika: rubika gateway");
 }
