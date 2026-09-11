@@ -192,6 +192,31 @@ Rubika client → botapi.rubika.ir/v3/{token}/getUpdates (long poll, 1s)
    defaults.
 
 
+## Agent Tools
+
+The `dsh-rubika` plugin exposes a custom tool for agents to send files to Rubika chats.
+
+### `rubika.sendFile`
+
+Send a file (photo, video, audio, or document) from the server to a Rubika chat.
+
+**Parameters:**
+
+*   `filePath` (string, required): Path to the file on the server (e.g., in `dsh/workspace/my_image.png`). The agent must have created or gained access to this file.
+*   `chatId` (string, required): Rubika `chat_id` to send the file to.
+*   `fileType` (enum: `'photo' | 'video' | 'audio' | 'document'`, required): Type of file to send.
+    *   `'photo'`: For images (e.g., JPG, PNG).
+    *   `'video'`: For video files (e.g., MP4).
+    *   `'audio'`: For audio files (e.g., MP3, OGG).
+    *   `'document'`: For general documents (e.g., PDF, TXT, ZIP).
+*   `caption` (string, optional): Caption for the file (max. 1024 characters).
+
+**Example usage from an agent (using Markdown code blocks for tool calls):**
+
+```python
+print(default_api.rubika.sendFile(chatId="YOUR_RUBIKA_CHAT_ID", filePath="output.txt", fileType="document", caption="Here is the analysis report."))
+```
+
 ## Enabling Vision (Image Input) Support
 
 If your `llm-pi-ai` provider uses a custom endpoint (e.g., `openai-completions` API via a proxy like `9router-production`) and you want to enable image input (vision) for models like `gemini/gemini-2.5-flash` or `gpt-4o`, you may encounter an error like `pi-ai model "..." does not support image input`.
