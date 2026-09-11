@@ -332,47 +332,40 @@ async function resetChatAgent(chatId) {
 async function getOrCreateAgent(ctx, chatId) {
   if (_agents.has(chatId)) return _agents.get(chatId);
 
-  // ── Default model selection (optional — must never throw) ──
-  // inject guarantees the service is available on this context.
+  // ── Default model selection ──
   let selection;
   try {
     selection = ctx.agentDefaultModel?.currentSelection?.();
   } catch {
     selection = undefined;
   }
-  // currentSelection() returns { provider, model, reasoningEffort? }
-  const hasModel = !!(selection && selection.provider && selection.model);
+  if (!selection || !selection.provider || !selection.model) {
+    throw new Error(
+      "مدل پیش‌فرض هوش مصنوعی در تنظیمات DSH مشخص نشده است. لطفاً از پنل وب (تنظیمات Models) یک مدل انتخاب کنید."
+    );
+  }
 
   const suffix = _chatSessionSuffix.get(chatId);
   const sessionId = SessionId(suffix ? `rubika:${chatId}:${suffix}` : `rubika:${chatId}`);
 
-  // NOTE: meta only accepts validated session fields (cwd, parentSession,
-  // seedLength, origin, delegationDepth, agentPreset). Extra keys fail the
-  // session-boundary validation — keep it minimal.
   const handle = await ctx.agents.create({
     sessionId,
     meta: { cwd: process.cwd() },
-    ...(hasModel
-      ? {
-          agentOptions: {
-            provider: selection.provider,
-            model: selection.model,
-          },
-        }
-      : {}),
+    agentOptions: {
+      provider: selection.provider,
+      model: selection.model,
+    },
     setup: (agentCtx) => {
-      if (hasModel) {
-        installModelSelection(agentCtx, {
-          current: {
-            provider: selection.provider,
-            model: selection.model,
-            ...(selection.reasoningEffort
-              ? { reasoningEffort: selection.reasoningEffort }
-              : {}),
-          },
-          assembled: undefined,
-        });
-      }
+      installModelSelection(agentCtx, {
+        current: {
+          provider: selection.provider,
+          model: selection.model,
+          ...(selection.reasoningEffort
+            ? { reasoningEffort: selection.reasoningEffort }
+            : {}),
+        },
+        assembled: undefined,
+      });
     },
   });
 
@@ -381,9 +374,10 @@ async function getOrCreateAgent(ctx, chatId) {
   return entry;
 }
 
-/** Extract the last assistant text from session events after a given seq. */
+/** Extract the last assistant text or turn error from session events after a given seq. */
 function extractReply(session, afterSeq) {
   let text = "";
+  let errorMsg = "";
   for (const event of session.events) {
     if (event.seq <= afterSeq) continue;
     if (event.type === "assistant/message") {
@@ -393,6 +387,12 @@ function extractReply(session, afterSeq) {
         .join("");
       if (joined) text = joined;
     }
+    if (event.type === "turn/end" && event.data.reason?.kind === "error") {
+      errorMsg = event.data.reason.error?.message || "خطای ناشناخته در مدل";
+    }
+  }
+  if (!text && errorMsg) {
+    return `❌ خطای هوش مصنوعی: ${errorMsg}`;
   }
   return text;
 }
