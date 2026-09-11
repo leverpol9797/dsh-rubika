@@ -21,7 +21,7 @@ import { SessionId } from "@deepseek-ai/dsh-session";
 
 export const name = "dsh-rubika";
 // Declare required services: cordis forbids ctx.<svc> access without inject.
-export const inject = ["agents", "agentDefaultModel"];
+export const inject = ["agents", "agentDefaultModel", "agentPresets", "sessionPersistence"];
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -348,35 +348,139 @@ async function getOrCreateAgent(ctx, chatId) {
   const suffix = _chatSessionSuffix.get(chatId);
   const sessionId = SessionId(suffix ? `rubika:${chatId}:${suffix}` : `rubika:${chatId}`);
 
-  const handle = await ctx.agents.create({
-    sessionId,
-    meta: { cwd: process.cwd() },
-    agentOptions: {
-      provider: selection.provider,
-      model: selection.model,
-    },
-    setup: (agentCtx) => {
-      installModelSelection(agentCtx, {
-        current: {
-          provider: selection.provider,
-          model: selection.model,
-          ...(selection.reasoningEffort
-            ? { reasoningEffort: selection.reasoningEffort }
-            : {}),
-        },
-        assembled: undefined,
+  // ── Check live agent in registry ──
+  const live = ctx.agents?.get?.(sessionId);
+  if (live) {
+    const entry = { agent: live, dispose: () => live.cancel() };
+    _agents.set(chatId, entry);
+    return entry;
+  }
+
+  // ── Resolve agent preset (default is 'standard' which contains all tools) ──
+  const presets = ctx.get("agentPresets") ?? ctx.agentPresets;
+  let presetId;
+  if (presets) {
+    try {
+      const resolved = await presets.resolve();
+      presetId = resolved?.id;
+    } catch (err) {
+      console.warn("[dsh-rubika] Warning resolving agent preset:", err.message);
+    }
+  }
+
+  const setup = async (agentCtx) => {
+    // 1. Install model selection
+    installModelSelection(agentCtx, {
+      current: {
+        provider: selection.provider,
+        model: selection.model,
+        ...(selection.reasoningEffort
+          ? { reasoningEffort: selection.reasoningEffort }
+          : {}),
+      },
+      assembled: undefined,
+    });
+
+    // 2. Set sandbox mode to danger-full-access & approval policy to never
+    const session = agentCtx.agent?.session;
+    if (session) {
+      try {
+        session.append("sandbox/mode", { mode: "danger-full-access" });
+        session.append("approval/policy", { policy: "never" });
+      } catch (err) {
+        console.warn("[dsh-rubika] Warning setting session policy:", err.message);
+      }
+    }
+
+    // 3. Mount the agent preset to install all tools (bash, fs, glob, grep, jobs, etc.)
+    if (presets && presetId) {
+      try {
+        await presets.mount(agentCtx, presetId);
+        console.log(`[dsh-rubika] Mounted preset "${presetId}" on agent for chat ${chatId}`);
+      } catch (err) {
+        console.error(`[dsh-rubika] Failed to mount preset "${presetId}":`, err);
+      }
+    }
+  };
+
+  const agentOptions = {
+    provider: selection.provider,
+    model: selection.model,
+  };
+
+  const cwd = process.cwd();
+
+  // Check if session exists in persistence to resume, otherwise create
+  let handle;
+  const persistence = ctx.get("sessionPersistence") ?? ctx.sessionPersistence;
+  let existsInPersistence = false;
+  if (persistence) {
+    try {
+      const list = await persistence.list();
+      existsInPersistence = list.some((h) => h.id === sessionId);
+    } catch {
+      existsInPersistence = false;
+    }
+  }
+
+  if (existsInPersistence) {
+    try {
+      handle = await ctx.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions,
+        setup,
       });
-    },
-  });
+    } catch (resumeErr) {
+      console.warn(`[dsh-rubika] Resume failed for ${sessionId}, creating fresh session:`, resumeErr.message);
+      const newSuffix = randomUUID().slice(0, 8);
+      _chatSessionSuffix.set(chatId, newSuffix);
+      const freshSessionId = SessionId(`rubika:${chatId}:${newSuffix}`);
+      handle = await ctx.agents.create({
+        sessionId: freshSessionId,
+        meta: {
+          cwd,
+          ...(presetId ? { agentPreset: presetId } : {}),
+        },
+        agentOptions,
+        setup,
+      });
+    }
+  } else {
+    try {
+      handle = await ctx.agents.create({
+        sessionId,
+        meta: {
+          cwd,
+          ...(presetId ? { agentPreset: presetId } : {}),
+        },
+        agentOptions,
+        setup,
+      });
+    } catch (createErr) {
+      console.warn(`[dsh-rubika] Create failed, trying fresh session ID for ${chatId}:`, createErr.message);
+      const newSuffix = randomUUID().slice(0, 8);
+      _chatSessionSuffix.set(chatId, newSuffix);
+      const freshSessionId = SessionId(`rubika:${chatId}:${newSuffix}`);
+      handle = await ctx.agents.create({
+        sessionId: freshSessionId,
+        meta: {
+          cwd,
+          ...(presetId ? { agentPreset: presetId } : {}),
+        },
+        agentOptions,
+        setup,
+      });
+    }
+  }
 
   const entry = { agent: handle.agent, dispose: handle.dispose };
   _agents.set(chatId, entry);
   return entry;
 }
 
-/** Extract the last assistant text or turn error from session events after a given seq. */
+/** Extract assistant text or turn error from session events after a given seq. */
 function extractReply(session, afterSeq) {
-  let text = "";
+  const textParts = [];
   let errorMsg = "";
   for (const event of session.events) {
     if (event.seq <= afterSeq) continue;
@@ -384,13 +488,15 @@ function extractReply(session, afterSeq) {
       const joined = event.data.message.content
         .filter((b) => b.type === "text")
         .map((b) => b.text)
-        .join("");
-      if (joined) text = joined;
+        .join("")
+        .trim();
+      if (joined) textParts.push(joined);
     }
     if (event.type === "turn/end" && event.data.reason?.kind === "error") {
       errorMsg = event.data.reason.error?.message || "خطای ناشناخته در مدل";
     }
   }
+  const text = textParts.join("\n\n");
   if (!text && errorMsg) {
     return `❌ خطای هوش مصنوعی: ${errorMsg}`;
   }

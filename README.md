@@ -32,8 +32,10 @@ gateway architecture, adapted to DSH's cordis plugin system.
 - A running **DeepSeek Harness** host (tested on the Railway template:
   Caddy on `$PORT` → `dsh web` on `127.0.0.1:3080`).
 - A Rubika bot token from **BotFather@** on Rubika.
-- The bot's DSH profile must provide the `agents` and `agentDefaultModel`
+- The bot's DSH profile must provide the `agents`, `agentDefaultModel`, `agentPresets`, and `sessionPersistence`
   services (the default `web` profile with `dsh-base` bundle does).
+- **All DSH tools and persona**: The gateway automatically mounts the DSH **Standard Agent Preset** (`default: standard`) for each agent session, enabling all core tools (bash, file system, glob, grep, job management, web search, subagents, and skills).
+- **Danger Full Access**: Agent sessions run with `danger-full-access` sandbox policy and `approval: never`, allowing unrestricted execution of all available tools without requiring manual approvals (which are not possible in a bot environment).
 
 ## Install (exact steps performed on Railway)
 
@@ -59,14 +61,16 @@ What `install.sh` does, step by step:
      dsh-session -> <dsh>/node_modules/@deepseek-ai/dsh-session
      schemastery -> <dsh>/node_modules/@deepseek-ai/.../schemastery
    ```
-3. **Registers** the plugin in the profile patch file
+   (`agentPresets` and `sessionPersistence` need no symlinks — they are
+   resolved at runtime through Cordis `inject`, not static imports.)
+4. **Registers** the plugin in the profile patch file
    `/home/dsh/.dsh/profiles/web/cordis.patch.yml`:
    ```yaml
    - insert:
        - id: dsh-rubika
          name: /home/dsh/dsh-rubika/gateway.js
    ```
-4. **Verifies** with `node --check` + a test `import()` of the plugin.
+5. **Verifies** with `node --check` + a test `import()` of the plugin.
 
 Then:
 
@@ -114,10 +118,29 @@ RUBIKA_GROUP_ALLOWED_CHATS=gXXX                # optional; bot must be in the gr
 ```
 Rubika client → botapi.rubika.ir/v3/{token}/getUpdates (long poll, 1s)
       → processUpdate: auth check → per-chat queue
-      → ctx.agents.create({ sessionId: "rubika:<chat_id>", ... })
+      → getOrCreateAgent: resolve default model + default agent preset
+      → ctx.agents.create/resume({ sessionId: "rubika:<chat_id>", ... })
+        setup: installModelSelection → set sandbox/mode + approval/policy
+               → agentPresets.mount(agentCtx, presetId)  // ALL tools
       → agent.followup(createUserMessage(...)) → agent.whenIdle()
-      → extract last assistant/message text → sendMessage(chat_id, reply)
+      → extract all assistant/message texts of the turn → sendMessage(chat_id, reply)
 ```
+
+- **Same tools as Web:** each Rubika agent mounts the deployment's default
+  agent preset (`standard`), so it gets the exact same tool catalog as a Web
+  session (bash/pwsh, filesystem, glob/grep, background jobs, subagents,
+  skills, web search) plus the preset persona and tool instructions.
+- **Bot-safe policy:** every Rubika session is switched to
+  `sandbox/mode = danger-full-access` and `approval/policy = never`, so tool
+  calls never stall on an interactive approval dialog that cannot be answered
+  from a messenger.
+- **Resume/restart safe:** live agents are reused via `agents.get()`;
+  persisted sessions are resumed via `agents.resume()`; otherwise a fresh
+  `agents.create()` session is published. If an old session cannot be resumed,
+  a new `rubika:<chat_id>:<suffix>` session is created automatically.
+- **After updating:** chats created before the preset fix keep their old
+  tool-less composition — send `/new` (or `/reset`, `/clear`) once so the chat
+  starts a fresh session with the full preset mounted.
 
 - **Pagination** follows the official docs: `offset_id` request cursor ←
   `next_offset_id` of the previous response.
@@ -140,8 +163,17 @@ Rubika client → botapi.rubika.ir/v3/{token}/getUpdates (long poll, 1s)
    (`cwd`, `parentSession`, …); extra keys (`platform`, `chatId`) failed the
    boundary. Kept minimal: `{ cwd: process.cwd() }`.
 5. **Missing `inject`** — cordis forbids `ctx.agents` without declaring it
-   (`cannot get property "agents" without inject`). Now
-   `inject = ["agents", "agentDefaultModel", "attachments"]`.
+   (`cannot get property "agents" without inject`).
+6. **Tool-less Rubika sessions (root cause)** — tools/persona live in the
+   agent preset (`standard`), not on the host plane. The gateway created
+   agents with only `installModelSelection` and never called
+   `agentPresets.mount(agentCtx, presetId)`, so Rubika agents had zero tools
+   while Web sessions had all of them. Now the gateway injects
+   `["agents", "agentDefaultModel", "agentPresets", "sessionPersistence"]`,
+   resolves the default preset, mounts it in `setup`, records
+   `agentPreset` in `meta`, sets `sandbox/mode = danger-full-access` +
+   `approval/policy = never`, and supports `agents.get()` / `agents.resume()`
+   with a fresh-session fallback. Old chats need one `/new` after updating.
 
 ## File attachments
 
