@@ -332,18 +332,44 @@ async function resetChatAgent(chatId) {
 async function getOrCreateAgent(ctx, chatId) {
   if (_agents.has(chatId)) return _agents.get(chatId);
 
-  // ── Default model selection ──
-  let selection;
-  try {
-    selection = ctx.agentDefaultModel?.currentSelection?.();
-  } catch {
-    selection = undefined;
-  }
-  if (!selection || !selection.provider || !selection.model) {
+  // ── Live model selection: follows the deployment default ──
+  // Read during EVERY prompt assembly rather than snapshotted at create time,
+  // so a model switched in the DSH Web UI applies to this chat on its next
+  // step. `lastGood` keeps the newest valid selection so a momentarily absent
+  // default falls back instead of failing the turn.
+  const lastGood = { current: undefined };
+  const readDefault = () => {
+    try {
+      const next = ctx.agentDefaultModel?.currentSelection?.();
+      return next && next.provider && next.model ? next : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const liveSelection = {
+    get current() {
+      const next = readDefault();
+      if (next !== undefined) {
+        lastGood.current = next;
+        return next;
+      }
+      // No default configured: reuse the last known good one (may be undefined,
+      // which installModelSelection treats as "leave the request untouched").
+      return lastGood.current;
+    },
+    set current(next) {
+      lastGood.current = next;
+    },
+    assembled: undefined,
+  };
+
+  const selection = readDefault();
+  if (selection === undefined) {
     throw new Error(
       "مدل پیش‌فرض هوش مصنوعی در تنظیمات DSH مشخص نشده است. لطفاً از پنل وب (تنظیمات Models) یک مدل انتخاب کنید."
     );
   }
+  lastGood.current = selection;
 
   const suffix = _chatSessionSuffix.get(chatId);
   const sessionId = SessionId(suffix ? `rubika:${chatId}:${suffix}` : `rubika:${chatId}`);
@@ -369,17 +395,9 @@ async function getOrCreateAgent(ctx, chatId) {
   }
 
   const setup = async (agentCtx) => {
-    // 1. Install model selection
-    installModelSelection(agentCtx, {
-      current: {
-        provider: selection.provider,
-        model: selection.model,
-        ...(selection.reasoningEffort
-          ? { reasoningEffort: selection.reasoningEffort }
-          : {}),
-      },
-      assembled: undefined,
-    });
+    // 1. Install LIVE model selection — every step re-reads the deployment
+    //    default, so changing the model in the Web UI applies here too.
+    installModelSelection(agentCtx, liveSelection);
 
     // 2. Set sandbox mode to danger-full-access & approval policy to never
     const session = agentCtx.agent?.session;

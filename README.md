@@ -138,6 +138,13 @@ Rubika client → botapi.rubika.ir/v3/{token}/getUpdates (long poll, 1s)
   persisted sessions are resumed via `agents.resume()`; otherwise a fresh
   `agents.create()` session is published. If an old session cannot be resumed,
   a new `rubika:<chat_id>:<suffix>` session is created automatically.
+- **Live model selection:** the model is re-read from
+  `ctx.agentDefaultModel.currentSelection()` on **every** prompt assembly
+  instead of being snapshotted when the chat session is created. Switching the
+  model in the DSH Web UI (Settings → Models) therefore applies to existing
+  Rubika chats on their next message — no `/new` needed. If the default is
+  momentarily unreadable, the last known good selection is reused so a turn
+  never fails on a bad read.
 - **After updating:** chats created before the preset fix keep their old
   tool-less composition — send `/new` (or `/reset`, `/clear`) once so the chat
   starts a fresh session with the full preset mounted.
@@ -174,6 +181,15 @@ Rubika client → botapi.rubika.ir/v3/{token}/getUpdates (long poll, 1s)
    `agentPreset` in `meta`, sets `sandbox/mode = danger-full-access` +
    `approval/policy = never`, and supports `agents.get()` / `agents.resume()`
    with a fresh-session fallback. Old chats need one `/new` after updating.
+7. **Model switch did not reach Rubika (stale model snapshot)** — the gateway
+   read `agentDefaultModel.currentSelection()` once at session-create time and
+   froze it for the agent's lifetime, so a model changed in the Web UI never
+   applied to an existing chat. An invalid/stale model then failed every turn
+   with `pi-ai provider "<p>" has no configured model "<m>"`. Now
+   `installModelSelection` receives a **live selection view** that re-reads the
+   default during each `system-prompt/assemble`, matching how the Web proxy's
+   `selectionFor()` behaves, with a last-known-good fallback for unreadable
+   defaults.
 
 ## File attachments
 
