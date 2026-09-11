@@ -12,8 +12,8 @@
 #   4. Registers the plugin in the profile's cordis.patch.yml (profile: web).
 #
 # Usage:
-#   sudo bash install.sh            # default paths
-#   DSH_HOME=/home/dsh DSH_PROFILE=web bash install.sh
+#   bash install.sh
+#   DSH_PROFILE=web bash install.sh
 #
 # After install:
 #   1. Set env vars (Railway dashboard → Variables, or export them):
@@ -26,18 +26,31 @@
 #
 set -euo pipefail
 
-DSH_HOME="${DSH_HOME:-/home/dsh}"
-DSH_PROFILE="${DSH_PROFILE:-web}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DSH_PROFILE="${DSH_PROFILE:-web}"
 
-PLUGIN_DIR="$DSH_HOME/dsh-rubika"
-PROFILE_DIR="$DSH_HOME/.dsh/profiles/$DSH_PROFILE"
+# Resolve DSH root directory and PROFILE_DIR safely
+if [ -n "${DSH_HOME:-}" ] && [ -d "$DSH_HOME/profiles/$DSH_PROFILE" ]; then
+  PROFILE_DIR="$DSH_HOME/profiles/$DSH_PROFILE"
+  PLUGIN_DIR="$(dirname "$DSH_HOME")/dsh-rubika"
+elif [ -d "/home/dsh/.dsh/profiles/$DSH_PROFILE" ]; then
+  PROFILE_DIR="/home/dsh/.dsh/profiles/$DSH_PROFILE"
+  PLUGIN_DIR="/home/dsh/dsh-rubika"
+elif [ -n "${DSH_HOME:-}" ] && [ -d "$DSH_HOME/.dsh/profiles/$DSH_PROFILE" ]; then
+  PROFILE_DIR="$DSH_HOME/.dsh/profiles/$DSH_PROFILE"
+  PLUGIN_DIR="$DSH_HOME/dsh-rubika"
+else
+  PROFILE_DIR="${DSH_HOME:-/home/dsh/.dsh}/profiles/$DSH_PROFILE"
+  PLUGIN_DIR="/home/dsh/dsh-rubika"
+fi
+
 PATCH_FILE="$PROFILE_DIR/cordis.patch.yml"
 
 # --- 0. Locate the DSH installation (source of the symlinked packages) ---
 DSH_PKG=""
 for candidate in \
-  "$DSH_HOME/.dsh" \
+  "${DSH_HOME:-/home/dsh/.dsh}" \
+  /home/dsh/.dsh \
   /opt/npm/lib/node_modules/@deepseek-ai/dsh \
 ; do
   if [ -d "$candidate/node_modules/@deepseek-ai/dsh-agent" ]; then
@@ -97,6 +110,12 @@ node -e "import('$PLUGIN_DIR/gateway.js').then(m => console.log('Import OK, expo
 # --- 5. Register in cordis.patch.yml ---
 mkdir -p "$PROFILE_DIR"
 touch "$PATCH_FILE"
+
+# Clean up standalone [] line which breaks YAML when appending items
+if grep -qE '^\s*\[\]\s*$' "$PATCH_FILE" 2>/dev/null; then
+  sed -i '/^\s*\[\]\s*$/d' "$PATCH_FILE"
+fi
+
 if grep -q "dsh-rubika" "$PATCH_FILE" 2>/dev/null; then
   echo "Already registered in $PATCH_FILE"
 else

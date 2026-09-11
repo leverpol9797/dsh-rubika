@@ -21,7 +21,7 @@ import { SessionId } from "@deepseek-ai/dsh-session";
 
 export const name = "dsh-rubika";
 // Declare required services: cordis forbids ctx.<svc> access without inject.
-export const inject = ["agents", "agentDefaultModel", "attachments"];
+export const inject = ["agents", "agentDefaultModel"];
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -210,9 +210,13 @@ async function prepareFileContent(ctx, token, file, caption) {
   // ── Images: download → attachments.saveImage → image block ──
   if (IMAGE_EXTS.has(ext)) {
     try {
+      const attachments = ctx.get?.("attachments") || ctx.attachments;
+      if (!attachments?.saveImage) {
+        throw new Error("سرویس پردازش تصویر (attachments) در دسترس نیست.");
+      }
       const url = await resolveDownloadUrl(token, fileId);
       const bytes = await downloadBytes(url, MAX_FILE_DOWNLOAD_BYTES);
-      const ref = await ctx.attachments.saveImage({
+      const ref = await attachments.saveImage({
         data: bytes,
         mediaType: IMAGE_MIME[ext],
         name,
@@ -591,21 +595,14 @@ function sleep(ms, signal) {
 
 // ─── DSH Plugin entry point ──────────────────────────────────────────────────
 
-import { writeFileSync } from "node:fs";
-
-const DEBUG_FILE = "/home/dsh/dsh-rubika/.applied";
-
 export function apply(ctx) {
-  // Debug: write file to confirm apply() was called
-  writeFileSync(DEBUG_FILE, new Date().toISOString() + " apply() called\n");
-
   const token = getToken();
   if (!token) {
-    writeFileSync(DEBUG_FILE, new Date().toISOString() + " RUBIKA_BOT_TOKEN not set\n");
+    console.log("[dsh-rubika] RUBIKA_BOT_TOKEN is not set — gateway disabled.");
     return;
   }
 
-  writeFileSync(DEBUG_FILE, new Date().toISOString() + " starting gateway...\n");
+  console.log("[dsh-rubika] Starting Rubika gateway...");
 
   ctx.effect(() => {
     const controller = new AbortController();
