@@ -911,13 +911,10 @@ async function pollLoop(ctx, token, signal) {
         } catch {}
       }
 
-      // Paginate if more pages
-      if (nextOffset && updates.length) {
-        offset = nextOffset;
-        continue;
-      }
+      // FIX: Always advance offset after processing a batch of updates.
+      // This ensures we don't re-read old updates if processUpdate returns early.
+      offset = nextOffset || "0"; // <--- این خط باید همیشه اینجا باشد
 
-      offset = nextOffset || "0";
       backoffIdx = 0;
       await sleep(POLL_INTERVAL_MS, signal);
     } catch (err) {
