@@ -452,6 +452,27 @@ function enqueueChat(chatId, fn) {
   return next;
 }
 
+// Max time one chat turn may occupy the gateway before the watchdog frees it.
+// A stuck turn (e.g. a model call that never settles) previously wedged both
+// the per-chat queue AND the poll loop via `await chatQueue`, so every chat
+// looked "dead" while the process stayed alive.
+const TURN_TIMEOUT_MS = parseInt(process.env.RUBIKA_TURN_TIMEOUT_MS || "300000", 10); // 5 min
+
+/**
+ * Wait for `promise`, but give up after `ms`. On timeout the turn is
+ * considered stuck: the error tells the caller to reset that chat's agent.
+ */
+function withTurnTimeout(promise, ms, chatId) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`turn timed out after ${Math.round(ms / 1000)}s`)),
+      ms
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // ─── Agent management ────────────────────────────────────────────────────────
 
 /** In-memory agent handles: chat_id → { agent, dispose } */
@@ -724,37 +745,59 @@ async function handleUserMessage(ctx, token, chatId, text, senderId, extraBlocks
 
   const { agent } = entry;
 
-  // ── Wait for agent to be idle (in case it's still processing) ──
-  await agent.whenIdle();
+  // ── Run the turn under a watchdog: a stuck model call must not wedge the
+  //    per-chat queue (and through it, the poll loop) forever. ──
+  try {
+    await withTurnTimeout(
+      (async () => {
+        // ── Wait for agent to be idle (in case it's still processing) ──
+        await agent.whenIdle();
 
-  // ── Record sequence before submitting message ──
-  const firstSeq = agent.session.seq;
+        // ── Record sequence before submitting message ──
+        const firstSeq = agent.session.seq;
 
-  // ── Submit message (text + optional extra blocks, e.g. images) ──
-  const content = [{ type: "text", text }];
-  if (extraBlocks?.length) content.push(...extraBlocks);
-  agent.followup(
-    createUserMessage({
-      content,
-      source: { kind: "user" },
-    })
-  );
+        // ── Submit message (text + optional extra blocks, e.g. images) ──
+        const content = [{ type: "text", text }];
+        if (extraBlocks?.length) content.push(...extraBlocks);
+        agent.followup(
+          createUserMessage({
+            content,
+            source: { kind: "user" },
+          })
+        );
 
-  // ── Wait for response ──
-  await agent.whenIdle();
+        // ── Wait for response ──
+        await agent.whenIdle();
+        return firstSeq;
+      })(),
+      TURN_TIMEOUT_MS,
+      chatId
+    ).then(async (firstSeq) => {
+      // ── Extract reply ──
+      const reply = extractReply(agent.session, firstSeq);
 
-  // ── Extract reply ──
-  const reply = extractReply(agent.session, firstSeq);
-
-  if (reply) {
-    await rubikaSendMessage(token, chatId, reply).catch((err) =>
-      console.error(`[dsh-rubika] Send failed for ${chatId}:`, err.message)
-    );
-  } else {
+      if (reply) {
+        await rubikaSendMessage(token, chatId, reply).catch((err) =>
+          console.error(`[dsh-rubika] Send failed for ${chatId}:`, err.message)
+        );
+      } else {
+        await rubikaSendMessage(
+          token,
+          chatId,
+          "🤖 پاسخی تولید نشد."
+        ).catch(() => {});
+      }
+    });
+  } catch (err) {
+    console.error(`[dsh-rubika] Turn failed for ${chatId}:`, err.message);
+    // The agent is wedged — drop it so the NEXT message starts a fresh
+    // session instead of queueing behind a turn that will never finish.
+    _agents.delete(chatId);
+    _chatSessionSuffix.set(chatId, randomUUID().slice(0, 8));
     await rubikaSendMessage(
       token,
       chatId,
-      "🤖 پاسخی تولید نشد."
+      "⏳ پاسخ طول کشید و نشست بازنشانی شد. لطفاً پیامتان را دوباره بفرستید."
     ).catch(() => {});
   }
 }
