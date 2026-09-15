@@ -1,0 +1,15 @@
+{
+  "name": "dsh-rubika",
+  "version": "1.1.0",
+  "description": "Rubika Bot gateway plugin for DeepSeek Harness (Bot API v3 long-polling)",
+  "type": "module",
+  "license": "MIT",
+  "dependencies": {
+    "unpdf": "^1.8.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-session": "*"
+  }
+}
